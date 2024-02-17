@@ -4,8 +4,8 @@ Repository to explore, then train some models on the emotions dataset.
 
 ## Setup
 
-Ensure that you have a virtual environment set up, then just run the `setup.py` file.
+Ensure that you have a virtual environment set up, then just run
 
 ```terminal
-python setup.py
+pip install -r requirements.txt
 ```
