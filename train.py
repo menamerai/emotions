@@ -6,7 +6,7 @@ import torch.nn as nn
 from tqdm import tqdm
 from collections import defaultdict
 from utils import *
-from model import *
+from models import *
 
 
 def get_accuracy(prediction, label):
@@ -17,7 +17,7 @@ def get_accuracy(prediction, label):
     return accuracy
 
 
-def train(data_loader, model, criterion, optimizer, device):
+def train(data_loader, model, criterion, optimizer, device, args):
     model.train()
     epoch_losses = []
     epoch_accs = []
@@ -25,7 +25,12 @@ def train(data_loader, model, criterion, optimizer, device):
         ids = batch["ids"].to(device)
         label = batch["label"].to(device)
 
-        preds = model(ids)
+        if args.model == "NBoW":
+            preds = model(ids)
+        elif args.model == "LSTM":
+            length = batch["length"]
+            preds = model(ids, length)
+
         loss = criterion(preds, label)
         acc = get_accuracy(preds, label)
 
@@ -39,7 +44,7 @@ def train(data_loader, model, criterion, optimizer, device):
     return np.mean(epoch_losses), np.mean(epoch_accs)
 
 
-def evaluate(data_loader, model, criterion, device):
+def evaluate(data_loader, model, criterion, device, args):
     model.eval()
     epoch_losses = []
     epoch_accs = []
@@ -48,7 +53,11 @@ def evaluate(data_loader, model, criterion, device):
             ids = batch["ids"].to(device)
             label = batch["label"].to(device)
 
-            preds = model(ids)
+            if args.model == "NBoW":
+                preds = model(ids)
+            elif args.model == "LSTM":
+                length = batch["length"]
+                preds = model(ids, length)
             loss = criterion(preds, label)
             acc = get_accuracy(preds, label)
 
@@ -60,20 +69,25 @@ def evaluate(data_loader, model, criterion, device):
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using {device} device")
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--logging", type=bool, default=True)
-    parser.add_argument("--epochs", type=int, default=18)
+    parser.add_argument("--logging", action="store_true")
+    parser.add_argument("--min_vocab_freq", type=int, default=1)
+    parser.add_argument("--model", type=str, default="NBoW")
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--embedding_dim", type=int, default=300)
     parser.add_argument("--max_length", type=int, default=300)
-    parser.add_argument("--min_vocab_freq", type=int, default=1)
-    parser.add_argument("--model", type=str, default="NBoW")
+    parser.add_argument("--n_layers", type=int, default=2)
+    parser.add_argument("--bidirectional", action="store_true")
+    parser.add_argument("--hidden_dim", type=int, default=300)
+    parser.add_argument("--dropout_rate", type=float, default=0.5)
 
     args = parser.parse_args()
 
-    if args.logging:
+    if args.logging and args.model == "NBoW":
         wandb.login()
         wandb.init(
             project="emotions",
@@ -86,8 +100,32 @@ if __name__ == "__main__":
             },
         )
 
+    elif args.logging and args.model == "LSTM":
+        wandb.login()
+        wandb.init(
+            project="emotions",
+            config={
+                "batch_size": args.batch_size,
+                "embedding_dim": args.embedding_dim,
+                "learning_rate": args.lr,
+                "epochs": args.epochs,
+                "model": args.model,
+                "hidden_dim": args.hidden_dim,
+                "n_layers": args.n_layers,
+                "bidirectional": args.bidirectional,
+                "dropout_rate": args.dropout_rate,
+            },
+        )
+
     train_data, val_data, _ = load_and_split_data()
     tokenizer = torchtext.data.utils.get_tokenizer("basic_english")
+
+    def tokenize_example(example: Dataset, tokenizer, max_length) -> dict[str, any]:
+        # for some reason, the mapping function refuses to work unless this function is defined here
+        # TODO: figure out why
+        tokens = tokenizer(example["text"])[:max_length]
+        length = len(tokens)
+        return {"tokens": tokens, "length": length}
 
     train_data = train_data.map(
         tokenize_example,
@@ -111,8 +149,12 @@ if __name__ == "__main__":
     train_data = train_data.map(numericalize_example, fn_kwargs={"vocab": vocab})
     val_data = val_data.map(numericalize_example, fn_kwargs={"vocab": vocab})
 
-    train_data.set_format(type="torch", columns=["ids", "label"])
-    val_data.set_format(type="torch", columns=["ids", "label"])
+    train_data.set_format(type="torch", columns=["ids", "label", "length"])
+    val_data.set_format(type="torch", columns=["ids", "label", "length"])
+
+    print(train_data[0])
+
+    print("Data preprocessing is done.")
 
     train_loader = get_data_loader(train_data, args.batch_size, pad_idx)
     val_loader = get_data_loader(val_data, args.batch_size, pad_idx, shuffle=False)
@@ -122,6 +164,18 @@ if __name__ == "__main__":
 
     if args.model == "NBoW":
         model = NBoW(vocab_size, args.embedding_dim, num_classes, pad_idx).to(device)
+
+    elif args.model == "LSTM":
+        model = LSTM(
+            vocab_size,
+            args.embedding_dim,
+            num_classes,
+            pad_idx,
+            args.hidden_dim,
+            args.n_layers,
+            args.bidirectional,
+            args.dropout_rate,
+        ).to(device)
 
     # TODO: add more models here
 
@@ -134,8 +188,8 @@ if __name__ == "__main__":
     metrics = defaultdict(list)
 
     for epoch in range(args.epochs):
-        train_loss, train_acc = train(train_loader, model, criterion, optimizer, device)
-        val_loss, val_acc = evaluate(val_loader, model, criterion, device)
+        train_loss, train_acc = train(train_loader, model, criterion, optimizer, device, args)
+        val_loss, val_acc = evaluate(val_loader, model, criterion, device, args)
 
         metrics["train_loss"].append(train_loss)
         metrics["train_acc"].append(train_acc)
@@ -154,7 +208,7 @@ if __name__ == "__main__":
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), "./models/nbow_model.pth")
+            torch.save(model.state_dict(), f"./models/{args.model}_model.pth")
 
         print(f"Epoch: {epoch+1}")
         print(f"Train loss: {train_loss:.4f}, Train acc: {train_acc:.4f}")
