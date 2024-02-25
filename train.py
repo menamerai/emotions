@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from tqdm import tqdm
 from collections import defaultdict
+from transformers import AutoModel, AutoTokenizer
 from utils import *
 from models import *
 
@@ -25,7 +26,7 @@ def train(data_loader, model, criterion, optimizer, device, args):
         ids = batch["ids"].to(device)
         label = batch["label"].to(device)
 
-        if args.model == "NBoW":
+        if args.model == "NBoW" or args.model == "Transformer":
             preds = model(ids)
         elif args.model == "LSTM":
             length = batch["length"]
@@ -53,7 +54,7 @@ def evaluate(data_loader, model, criterion, device, args):
             ids = batch["ids"].to(device)
             label = batch["label"].to(device)
 
-            if args.model == "NBoW":
+            if args.model == "NBoW" or args.model == "Transformer":
                 preds = model(ids)
             elif args.model == "LSTM":
                 length = batch["length"]
@@ -84,6 +85,8 @@ if __name__ == "__main__":
     parser.add_argument("--bidirectional", action="store_true")
     parser.add_argument("--hidden_dim", type=int, default=300)
     parser.add_argument("--dropout_rate", type=float, default=0.5)
+    parser.add_argument("--transformer_model", type=str, default="bert-base-uncased")
+    parser.add_argument("--freeze", action="store_true")
 
     args = parser.parse_args()
 
@@ -117,49 +120,87 @@ if __name__ == "__main__":
             },
         )
 
+    elif args.logging and args.model == "Transformer":
+        wandb.login()
+        wandb.init(
+            project="emotions",
+            config={
+                "batch_size": args.batch_size,
+                "learning_rate": args.lr,
+                "epochs": args.epochs,
+                "model": args.model,
+                "transformer_model": args.transformer_model,
+                "freeze": args.freeze,
+            },
+        )
+
     train_data, val_data, _ = load_and_split_data()
-    tokenizer = torchtext.data.utils.get_tokenizer("basic_english")
+    if args.model == "Transformer":
+        tokenizer = AutoTokenizer.from_pretrained(args.transformer_model)
+    else:
+        tokenizer = torchtext.data.utils.get_tokenizer("basic_english")
 
-    def tokenize_example(example: Dataset, tokenizer, max_length) -> dict[str, any]:
-        # for some reason, the mapping function refuses to work unless this function is defined here
-        # TODO: figure out why
-        tokens = tokenizer(example["text"])[:max_length]
-        length = len(tokens)
-        return {"tokens": tokens, "length": length}
+    if args.model == "NBoW" or args.model == "LSTM":
 
-    train_data = train_data.map(
-        tokenize_example,
-        fn_kwargs={"tokenizer": tokenizer, "max_length": args.max_length},
-    )
+        def tokenize_example(example: Dataset, tokenizer, max_length) -> dict[str, any]:
+            # for some reason, the mapping function refuses to work unless this function is defined here
+            # TODO: figure out why
+            tokens = tokenizer(example["text"])[:max_length]
+            length = len(tokens)
+            return {"tokens": tokens, "length": length}
 
-    val_data = val_data.map(
-        tokenize_example,
-        fn_kwargs={"tokenizer": tokenizer, "max_length": args.max_length},
-    )
+        train_data = train_data.map(
+            tokenize_example,
+            fn_kwargs={"tokenizer": tokenizer, "max_length": args.max_length},
+        )
 
-    vocab = torchtext.vocab.build_vocab_from_iterator(
-        train_data["tokens"], min_freq=args.min_vocab_freq, specials=["<unk>", "<pad>"]
-    )
+        val_data = val_data.map(
+            tokenize_example,
+            fn_kwargs={"tokenizer": tokenizer, "max_length": args.max_length},
+        )
 
-    unk_idx = vocab["<unk>"]
-    pad_idx = vocab["<pad>"]
+        vocab = torchtext.vocab.build_vocab_from_iterator(
+            train_data["tokens"], min_freq=args.min_vocab_freq, specials=["<unk>", "<pad>"]
+        )
 
-    vocab.set_default_index(unk_idx)
+        unk_idx = vocab["<unk>"]
+        pad_idx = vocab["<pad>"]
 
-    train_data = train_data.map(numericalize_example, fn_kwargs={"vocab": vocab})
-    val_data = val_data.map(numericalize_example, fn_kwargs={"vocab": vocab})
+        vocab.set_default_index(unk_idx)
 
-    train_data.set_format(type="torch", columns=["ids", "label", "length"])
-    val_data.set_format(type="torch", columns=["ids", "label", "length"])
+        train_data = train_data.map(numericalize_example, fn_kwargs={"vocab": vocab})
+        val_data = val_data.map(numericalize_example, fn_kwargs={"vocab": vocab})
 
-    print(train_data[0])
+        train_data.set_format(type="torch", columns=["ids", "label", "length"])
+        val_data.set_format(type="torch", columns=["ids", "label", "length"])
 
-    print("Data preprocessing is done.")
+        print(train_data[0])
 
-    train_loader = get_data_loader(train_data, args.batch_size, pad_idx)
-    val_loader = get_data_loader(val_data, args.batch_size, pad_idx, shuffle=False)
+        print("Data preprocessing is done.")
 
-    vocab_size = len(vocab)
+        train_loader = get_data_loader(train_data, args.batch_size, pad_idx, include_length=True)
+        val_loader = get_data_loader(val_data, args.batch_size, pad_idx, shuffle=False, include_length=True)
+
+        vocab_size = len(vocab)
+
+    elif args.model == "Transformer":
+        train_data = train_data.map(
+            tokenize_and_numericalize_example,
+            fn_kwargs={"tokenizer": tokenizer},
+        )
+        val_data = val_data.map(
+            tokenize_and_numericalize_example,
+            fn_kwargs={"tokenizer": tokenizer},
+        )
+
+        train_data.set_format(type="torch", columns=["ids", "label"])
+        val_data.set_format(type="torch", columns=["ids", "label"])
+
+        train_loader = get_data_loader(train_data, args.batch_size, tokenizer.pad_token_id)
+        val_loader = get_data_loader(val_data, args.batch_size, tokenizer.pad_token_id, shuffle=False)
+
+        vocab_size = tokenizer.vocab_size
+
     num_classes = len(train_data.unique("label"))
 
     if args.model == "NBoW":
@@ -176,6 +217,10 @@ if __name__ == "__main__":
             args.bidirectional,
             args.dropout_rate,
         ).to(device)
+
+    elif args.model == "Transformer":
+        transformer = AutoModel.from_pretrained(args.transformer_model)
+        model = Transformer(transformer, num_classes, freeze=args.freeze).to(device)
 
     # TODO: add more models here
 
